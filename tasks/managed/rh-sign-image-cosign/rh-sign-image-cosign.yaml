@@ -141,9 +141,8 @@ spec:
         function check_and_sign() {
           local identity=$1
           local reference=$2
-          local tag=$3
-          local digest=$4
-          found_signatures=$(check_existing_signatures "$identity" "$reference:$tag" "$digest")
+          local digest=$3
+          found_signatures=$(check_existing_signatures "$identity" "$reference@$digest" "$digest")
           if [ -z "$found_signatures" ]; then
             found_signatures=0
           fi
@@ -203,7 +202,7 @@ spec:
                             while (( ${RUNNING_JOBS@P} >= $(params.concurrentLimit) )); do
                                 wait -n
                             done
-                            check_and_sign "${REGISTRY_REF}:${TAG}" "${INTERNAL_CONTAINER_REF}" "${TAG}" "${MDIGEST}" &
+                            check_and_sign "${REGISTRY_REF}:${TAG}" "${INTERNAL_CONTAINER_REF}" "${MDIGEST}" &
                         done
                     done
                 done
@@ -215,7 +214,7 @@ spec:
                     while (( ${RUNNING_JOBS@P} >= $(params.concurrentLimit) )); do
                         wait -n
                     done
-                    check_and_sign "${REGISTRY_REF}:${TAG}" "${INTERNAL_CONTAINER_REF}" "${TAG}" "${DIGEST}" &
+                    check_and_sign "${REGISTRY_REF}:${TAG}" "${INTERNAL_CONTAINER_REF}" "${DIGEST}" &
                 done
             done
         done
