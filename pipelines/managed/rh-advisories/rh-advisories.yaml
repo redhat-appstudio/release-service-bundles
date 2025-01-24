@@ -490,6 +490,7 @@ spec:
         - input: "$(tasks.collect-atlas-params.results.secretName)"
           operator: notin
           values: [""]
+      onError: continue
       taskRef:
         params:
           - name: url
@@ -512,11 +513,12 @@ spec:
         - collect-atlas-params
         - push-rpm-data-to-pyxis
         - populate-release-notes-images
-    - name: upload-component-sbom
+    - name: upload-component-sbom  # if update-component-sbom fails, this is skipped
       when:
         - input: "$(tasks.collect-atlas-params.results.secretName)"
           operator: notin
           values: [""]
+      onError: continue
       params:
         - name: sbomDir
           value: "$(tasks.push-rpm-data-to-pyxis.results.sbomPath)"
@@ -616,6 +618,7 @@ spec:
         - input: "$(tasks.collect-atlas-params.results.secretName)"
           operator: notin
           values: [""]
+      onError: continue
       params:
         - name: dataJsonPath
           value: "$(tasks.collect-data.results.data)"
@@ -634,11 +637,12 @@ spec:
       runAfter:
         - collect-atlas-params
         - populate-release-notes-images
-    - name: upload-product-sbom
+    - name: upload-product-sbom  # if create-product-sbom fails, this is skipped
       when:
         - input: "$(tasks.collect-atlas-params.results.secretName)"
           operator: notin
           values: [""]
+      onError: continue
       params:
         - name: sbomDir
           value: "$(tasks.create-product-sbom.results.productSBOMPath)"
