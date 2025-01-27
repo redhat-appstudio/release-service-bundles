@@ -261,3 +261,5 @@ spec:
           value: $(params.ociArtifactExpiresAfter)
         - name: "ORAS_OPTIONS"
           value: "--insecure"
+        - name: "HOME"
+          value: "/tekton/home"
