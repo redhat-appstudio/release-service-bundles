@@ -4,7 +4,7 @@ kind: Task
 metadata:
   name: publish-to-cgw
   labels:
-    app.kubernetes.io/version: "0.2.6"
+    app.kubernetes.io/version: "0.3.0"
   annotations:
     tekton.dev/pipelines.minVersion: "0.12.1"
     tekton.dev/tags: release
@@ -56,18 +56,29 @@ spec:
         #!/usr/bin/env bash
         python3 <<EOF
         """
-        Run push-cgw-metadata command to push metadata to CGW:
-        1. Extract all components under contentGateway key from dataPath
-        2. Find all the files in contentDir that starts with the component name
+        This script interacts with the Content Gateway (CGW) API to create and manage 
+        files for a specified product and version. It performs the following tasks:
+        1. Get Product ID and Version ID from CGW API.
+        2. Extract all components under contentGateway key from dataPath
+        3. Find all the files in contentDir that starts with the component name
         4. Generate necessary metadata for each file
-        5. Dump the metadata to a YAML file
-        6. Run push-cgw-metadata to push the metadata
+        5. Create files using the metadata and skip if the file already exists
+        6. Rollback created files on failure
+        7. Dump the metadata to a YAML file
+        8. Dump the result data to a JSON file
         """
+
         import os
         import json
-        import yaml
         import hashlib
-        import subprocess
+        import requests
+        from requests.auth import HTTPBasicAuth
+        import yaml
+
+        # Environment variables
+        BASE_URL = "$(params.cgwHostname)"
+        USERNAME = os.getenv("CGW_USERNAME")
+        PASSWORD = os.getenv("CGW_PASSWORD")
 
         DATA_FILE = "$(workspaces.data.path)/$(params.dataPath)"
         CONTENT_DIR = "$(workspaces.data.path)/$(params.contentDir)"
@@ -75,26 +86,15 @@ spec:
         # Grab the path of datafile and use that as workspace directory
         WORKSPACE_DIR = os.path.dirname(DATA_FILE)
         METADATA_FILE_PATH = f"{WORKSPACE_DIR}/cgw_metadata.yaml"
-        RESULT_FILE_JSON_PATH=f"{WORKSPACE_DIR}/results.json"
-
-        with open(DATA_FILE, 'r') as file:
-            data = json.load(file)
-
-        os.makedirs(WORKSPACE_DIR, exist_ok=True)
-
-        productName = data['contentGateway']['productName']
-        productCode = data['contentGateway']['productCode']
-        productVersionName = data['contentGateway']['productVersionName']
-        mirrorOpenshiftPush = data['contentGateway'].get('mirrorOpenshiftPush')
-        components = data['contentGateway']['components']
-        content_list = os.listdir(CONTENT_DIR)
+        RESULT_FILE_JSON_PATH = f"{WORKSPACE_DIR}/results.json"
 
         # Default values for each component,
         # values from DATA_FILE takes presedence over these
         default_values_per_component = {
-            'type': "FILE",
+            "type": "FILE",
             "hidden": False,
-            "invisible": False
+            "invisible": False,
+            "order": 0,
         }
 
         def generate_download_url(file_name):
@@ -110,41 +110,72 @@ spec:
             checksum = sha256_hash.hexdigest()
             return f"{prefix}/{checksum[:2]}/{checksum}/{file_name}"
 
-        def generate_metadata(content_list, components):
+        def call_cgw_api(method, endpoint, data=None):
+            """Make an API call to the Content Gateway service."""
+            try:
+                response = requests.request(
+                    method=method.upper(),
+                    url=f"{BASE_URL}{endpoint}",
+                    headers={"Accept": "application/json", "Content-Type": "application/json"},
+                    auth=HTTPBasicAuth(USERNAME, PASSWORD),
+                    json=data,
+                )
+                response.raise_for_status()
+                return response
+            except requests.RequestException as e:
+                raise requests.RequestException({e.response.text})
+
+        def get_product_id(product_name):
+            """Retrieve the product ID by name."""
+            products = call_cgw_api("GET", "/products")
+            products = products.json()
+            for product in products:
+                if product.get("name") == product_name:
+                    return product.get("id")
+            raise ValueError(f"Product not found: {product_name}")
+
+        def get_version_id(product_id, version_name):
+            """Retrieve the version ID for a specific product."""
+            versions = call_cgw_api("GET", f"/products/{product_id}/versions")
+            versions = versions.json()
+            for version in versions:
+                if version.get("versionName") == version_name:
+                    return version.get("id")
+            raise ValueError(f"Version not found: {version_name}")
+
+        def generate_metadata(content_list, components, product_id, productVersion_id):
             """
             Generate metadata for each file in
             content_list that starts with the component name
             """
-            shortURL_base = '/pub/'
+            shortURL_base = "/pub/"
             if mirrorOpenshiftPush:
-                shortURL_base = '/pub/cgw'
+                shortURL_base = "/pub/cgw"
             metadata = []
             shasum_files_processed = []
             for file in content_list:
                 matching_component = None
                 for component in components:
-                    if file.startswith(component['name']):
+                    if file.startswith(component["name"]):
                         matching_component = component.copy()
                         break
 
                 if matching_component:
                     print("Processing file: ", file)
-                    matching_component.update({
-                        'productName': productName,
-                        'productCode': productCode,
-                        'productVersionName': productVersionName,
-                        'downloadURL': generate_download_url(file),
-                        'shortURL': f"{shortURL_base}/{productCode}/{productVersionName}/{file}",
-                        'label': file,
-                    })
-                    del matching_component['name']
-                    metadata.append({
-                        'type': 'file',
-                        'action': 'create',
-                        'metadata': {**default_values_per_component, **matching_component}
-                    })
+                    matching_component.update(
+                        {
+                            "productVersionId": productVersion_id,
+                            "downloadURL": generate_download_url(file),
+                            "shortURL": f"{shortURL_base}/{product_id}/{productVersion_id}/{file}",
+                            "label": file,
+                        }
+                    )
+                    del matching_component["name"]
+                    metadata.append(
+                        {"type": "file", **default_values_per_component, **matching_component}
+                    )
                 else:
-                    if file.startswith('sha256') and file not in shasum_files_processed:
+                    if file.startswith("sha256") and file not in shasum_files_processed:
                         shasum_files_processed.append(file)
                         print("Processing file: ", file)
                         if file.endswith(".gpg"):
@@ -154,60 +185,115 @@ spec:
                         elif file.endswith(".txt"):
                             label = "Checksum"
 
-                        metadata.append({
-                            'type': 'file',
-                            'action': 'create',
-                            'metadata': {
-                                'productName': productName,
-                                'productCode': productCode,
-                                'productVersionName': productVersionName,
-                                'downloadURL': generate_download_url(file),
-                                'shortURL': f"{shortURL_base}/{productCode}/{productVersionName}/{file}",
-                                'label': label,
-                                **default_values_per_component
+                        metadata.append(
+                            {
+                                "productVersionId": productVersionId,
+                                "downloadURL": generate_download_url(file),
+                                "shortURL": f"{shortURL_base}/{product_id}/{productVersion_id}/{file}",
+                                "label": label,
+                                **default_values_per_component,
                             }
-                        })
+                        )
                     else:
                         # Skip files that do not start with any component name or
                         # sha256
-                        print(f"Skipping file: {file} as it does not start with any \
-                            component name")
+                        print(
+                            f"Skipping file: {file} as it does not start with any \
+                            component name"
+                        )
                         continue
 
             return metadata
 
-        metadata = generate_metadata(content_list, components)
-        print(len(metadata), "Files will be publised to CGW")
+        def file_already_exists(existing_files, new_file):
+            """Check if a file already exists."""
+            return any(
+                all(
+                    file.get(key) == new_file.get(key)
+                    for key in ["description", "label", "downloadURL", "shortURL"]
+                )
+                for file in existing_files
+            )
 
-        with open(METADATA_FILE_PATH, 'w') as file:
-            yaml.dump(metadata, file, default_flow_style=False, sort_keys=False)
+        def create_files(product_id, version_id, metadata):
+            """Create files using the metadata and rollback on failure."""
+            created_files = []
+            skipped_files = []
+            try:
+                existing_files = call_cgw_api(
+                    "GET", f"/products/{product_id}/versions/{version_id}/files"
+                )
+                existing_files = existing_files.json()
+                for file_metadata in metadata:
+                    if file_already_exists(existing_files, file_metadata):
+                        skipped_files.append(file_metadata.get("id"))
+                        print(
+                            f"Skipping creation: File {file_metadata['label']} already exists with ShortURL {file_metadata['shortURL']}"
+                        )
+                        continue
+                    print(
+                        f"Creating file: {file_metadata['label']} with ShortURL {file_metadata['shortURL']}"
+                    )
+                    created_file = call_cgw_api(
+                        "POST",
+                        f"/products/{product_id}/versions/{version_id}/files",
+                        file_metadata,
+                    )
+                    print(
+                        f"Created file: {file_metadata['label']} with ShortURL {file_metadata['shortURL']}"
+                    )
+                    created_files.append(created_file.json())
+                return created_files, skipped_files
+            except Exception as e:
+                rollback_files(product_id, version_id, created_files)
+                raise Exception(f"Failed to create file: {e}")
 
-        print(f"YAML content dumped to {METADATA_FILE_PATH}")
-
-        command = [
-            'push-cgw-metadata',
-            '--CGW_hostname', '$(params.cgwHostname)',
-            '--CGW_username', '${CGW_USERNAME}',
-            '--CGW_filepath', METADATA_FILE_PATH
-        ]
+        def rollback_files(product_id, version_id, created_files):
+            """Rollback created files by ID."""
+            for file in created_files:
+                try:
+                    call_cgw_api(
+                        "DELETE", f"/products/{product_id}/versions/{version_id}/files/{file}"
+                    )
+                except Exception as e:
+                    raise Exception(f"Failed to rollback file: {e}")
 
         try:
-            result = subprocess.run(command, capture_output=True, text=True, check=True)
-            command_output = result.stderr # using stderr to capture logged output
-            print(f"Command succeeded with {command_output}")
-        except subprocess.CalledProcessError as error:
-            print(f"Command failed with return code {error.returncode}\n")
-            print(f"CGW metadata that was passed: {metadata}\n")
-            command_output = error.stderr
-            print(f" ERROR:\n{command_output}")
-            raise
+            with open(DATA_FILE, "r") as file:
+                data = json.load(file)
+            os.makedirs(WORKSPACE_DIR, exist_ok=True)
+            
+            productName = data["contentGateway"]["productName"]
+            productCode = data["contentGateway"]["productCode"]
+            productVersionName = data["contentGateway"]["productVersionName"]
+            mirrorOpenshiftPush = data["contentGateway"].get("mirrorOpenshiftPush")
+            components = data["contentGateway"]["components"]
+            content_list = os.listdir(CONTENT_DIR)
 
-        result_data = {"no_of_files_processed": len(metadata),
-                        "metadata_file_path": METADATA_FILE_PATH,
-                        "command_output": command_output}
+            productId = get_product_id(productName)
+            productVersionId = get_version_id(productId, productVersionName)
+            metadata = generate_metadata(content_list, components, productId, productVersionId)
+            created, skipped = create_files(productId, productVersionId, metadata)
 
-        with open(RESULT_FILE_JSON_PATH, 'w') as f:
-            json.dump(result_data, f)
-        with open('$(results.resultDataPath.path)', 'w') as f:
-            f.write(RESULT_FILE_JSON_PATH)
+            with open(METADATA_FILE_PATH, "w") as file:
+                yaml.dump(metadata, file, default_flow_style=False, sort_keys=False)
+            print(f"YAML content dumped to {METADATA_FILE_PATH}")
+
+            result_data = {
+                "no_of_files_processed": len(metadata),
+                "no_of_files_created": len(created),
+                "no_of_files_skipped": len(skipped),
+                "metadata_file_path": METADATA_FILE_PATH,
+            }
+
+            print(f"{len(created)} files created and {len(skipped)} files skipped")
+
+            with open(RESULT_FILE_JSON_PATH, "w") as f:
+                json.dump(result_data, f)
+            with open("$(results.resultDataPath.path)", "w") as f:
+                f.write(RESULT_FILE_JSON_PATH)
+
+        except Exception as e:
+            print(f"Error: {e}")
+            exit(1)
         EOF
